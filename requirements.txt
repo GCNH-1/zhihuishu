@@ -1,0 +1,7 @@
+mss>=10,<11
+numpy>=2,<3
+opencv-python>=4.10,<6
+rapidocr>=3.9,<4
+onnxruntime>=1.27,<2
+PyAutoGUI>=0.9.54,<1
+pynput>=1.7.8,<2
