@@ -89,6 +89,17 @@ class SwitchControllerTests(unittest.TestCase):
         self.assertEqual(middle.update(TimerReading(5, 120), 27).action, "none")
         self.assertEqual(middle.state, "watching")
 
+    # 【新增】答题 API 可能耗时较长，关闭弹窗后重新起算 12 秒播放确认。
+    def test_quiz_resume_resets_progress_timeout(self) -> None:
+        """答题后只验证新播放点击，避免沿用弹窗前的超时。"""
+
+        controller = SwitchController(started_at=0)
+        controller.update(TimerReading(12, 100), 1)
+        controller.after_quiz_play(TimerReading(12, 100), 100)
+        self.assertEqual(controller.update(TimerReading(12, 100), 105).action, "none")
+        self.assertEqual(controller.update(TimerReading(13, 100), 107).action, "none")
+        self.assertEqual(controller.state, "watching")
+
 
 if __name__ == "__main__":
     unittest.main()

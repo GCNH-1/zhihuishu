@@ -11,6 +11,7 @@ import random
 import time
 
 from .core import TimerReading, parse_timer
+from .quiz import OcrLine, QuizCalibration, QuizSnapshot, is_quiz_visible, parse_quiz_view
 
 
 class _Rect(ctypes.Structure):
@@ -275,10 +276,41 @@ class WindowsDesktop:
         width, height = config.screen_size
         rect = max(0, wl), max(0, wt), min(width, wr), min(height, wb)
         text = self._ocr_text(rect, timer=False).lower().replace(" ", "")
-        for marker in ("验证码", "人机验证", "请完成验证", "开始测验", "提交答案", "captcha", "startquiz"):
+        # 【修改】无答题标定时也识别 AI 助教弹窗，让程序明确提示用户进行标定。
+        for marker in ("验证码", "人机验证", "请完成验证", "AI助教小智", "开始测验", "提交答案", "captcha", "startquiz"):
             if marker in text:
                 return marker
         return None
+
+    # 【新增】保留 OCR 文字框的绝对屏幕坐标，使选项数变化时仍能点击正确标签。
+    def quiz_snapshot_from_image(self, image, rect: tuple[int, int, int, int]) -> QuizSnapshot:
+        """将指定弹窗画面转换为 PNG 和带坐标的 OCR 结果。"""
+
+        encoded_ok, encoded = self.cv2.imencode(".png", image)
+        if not encoded_ok:
+            raise RuntimeError("无法编码答题弹窗截图")
+        result = self.ocr(image, use_det=True, use_cls=False)
+        boxes = getattr(result, "boxes", None)
+        texts = getattr(result, "txts", None)
+        lines: list[OcrLine] = []
+        if boxes is not None and texts is not None:
+            for value, box in zip(texts, boxes):
+                points = self.np.asarray(box)
+                left = int(points[:, 0].min()) + rect[0]
+                top = int(points[:, 1].min()) + rect[1]
+                right = int(points[:, 0].max()) + rect[0]
+                bottom = int(points[:, 1].max()) + rect[1]
+                lines.append(OcrLine(str(value), (left, top, right, bottom)))
+        return QuizSnapshot(encoded.tobytes(), tuple(lines))
+
+    # 【新增】只截取用户标定的白色弹窗，避免把课程视频及页面周边内容发送给模型。
+    def read_quiz(self, config: QuizCalibration) -> QuizSnapshot:
+        """读取当前弹窗区域。"""
+
+        left, top, right, bottom = config.dialog_rect
+        shot = self.mss.grab({"left": left, "top": top, "width": right - left, "height": bottom - top})
+        image = self.np.asarray(shot)[:, :, :3].copy()
+        return self.quiz_snapshot_from_image(image, config.dialog_rect)
 
 
 def capture_point(desktop: WindowsDesktop, label: str) -> tuple[WindowInfo, tuple[int, int]]:
@@ -440,6 +472,102 @@ def make_calibration(desktop: WindowsDesktop) -> Calibration:
     print(f"OCR 原文：{raw!r}；解析结果：{reading}")
     if reading is None:
         raise ValueError("截图中的计时可识别，但实时计时不可见；请调整控制栏悬停点后重新标定")
+    return config
+
+
+# 【新增】答题弹窗遮住计时栏，因此单独冻结截图标定弹窗范围。
+# 参数: desktop (WindowsDesktop) 桌面截图和 OCR；video_config (Calibration) 已保存的视频窗口。
+# 返回: QuizCalibration 经标题、选项和关闭按钮验证的弹窗范围。
+def make_quiz_calibration(desktop: WindowsDesktop, video_config: Calibration) -> QuizCalibration:
+    """引导用户框选已打开的 AI 助教答题弹窗。"""
+
+    input("\n请先让答题弹窗显示。按 Enter 后切到课程浏览器，将鼠标放在弹窗内；5 秒后冻结截图：")
+    for remaining in range(5, 0, -1):
+        print(f"  {remaining}...", flush=True)
+        time.sleep(1)
+    window = window_at_point(desktop.point())
+    if window.class_name != video_config.window_class or window.rect != video_config.window_rect:
+        raise ValueError("答题弹窗与视频标定的浏览器窗口不一致")
+    width, height = primary_screen_size()
+    if (width, height) != video_config.screen_size:
+        raise ValueError("屏幕分辨率已变化，请重新标定视频窗口")
+    shot = desktop.mss.grab({"left": 0, "top": 0, "width": width, "height": height})
+
+    import tkinter as tk
+    from PIL import Image, ImageTk
+
+    root = tk.Tk()
+    root.title("框选整个答题弹窗")
+    root.attributes("-fullscreen", True)
+    root.attributes("-topmost", True)
+    canvas = tk.Canvas(root, width=width, height=height, highlightthickness=0, cursor="crosshair")
+    canvas.pack()
+    photo = ImageTk.PhotoImage(Image.frombytes("RGB", (width, height), shot.rgb))
+    canvas.create_image(0, 0, anchor="nw", image=photo)
+    canvas.image = photo
+    canvas.create_rectangle(0, 0, width, 42, fill="#17202b", outline="")
+    status = canvas.create_text(
+        12, 21, anchor="w", fill="white", font=("Microsoft YaHei UI", 12),
+        text="拖框圈住完整白色弹窗，包含标题、所有选项和关闭按钮；验证成功后按 Enter，Esc 取消",
+    )
+    start: list[int] = []
+    selection: list[tuple[int, int, int, int]] = []
+    outline: list[int] = []
+
+    # 【新增】在冻结画面上拖框，避免弹窗关闭或视频画面变化导致位置漂移。
+    def on_press(event) -> None:
+        start[:] = [event.x, event.y]
+        selection.clear()
+        if outline:
+            canvas.delete(outline.pop())
+        outline.append(canvas.create_rectangle(event.x, event.y, event.x, event.y, outline="#00e0a4", width=2))
+
+    # 【新增】拖动时显示范围，便于用户检查是否包含弹窗底部按钮。
+    def on_drag(event) -> None:
+        if start and outline:
+            canvas.coords(outline[0], start[0], start[1], event.x, event.y)
+
+    # 【新增】只有 OCR 同时看到弹窗标题、连续选项和关闭按钮，才允许保存。
+    def on_release(event) -> None:
+        if not start:
+            return
+        left, right = sorted((max(0, min(width, start[0])), max(0, min(width, event.x))))
+        top, bottom = sorted((max(0, min(height, start[1])), max(0, min(height, event.y))))
+        rect = (left, top, right, bottom)
+        try:
+            candidate = QuizCalibration(video_config.window_class, video_config.window_rect, (width, height), rect)
+            candidate.validate()
+            image = desktop.np.asarray(shot)[top:bottom, left:right, :3].copy()
+            view = parse_quiz_view(desktop.quiz_snapshot_from_image(image, rect))
+            if view.multi_page:
+                raise ValueError("当前弹窗显示多题提示；此版本只处理单题弹窗")
+        except (ValueError, RuntimeError) as exc:
+            canvas.itemconfigure(status, text=f"识别失败：{exc}；请重框")
+            return
+        selection[:] = [rect]
+        canvas.itemconfigure(status, text=f"已定位 {','.join(sorted(view.options))} 和关闭按钮；按 Enter 保存")
+
+    # 【新增】确认后才返回坐标；未确认的拖框绝不写入配置。
+    def on_confirm(_event) -> None:
+        if selection:
+            root.destroy()
+
+    # 【新增】Esc 取消标定，不改动已有视频配置。
+    def on_cancel(_event) -> None:
+        selection.clear()
+        root.destroy()
+
+    canvas.bind("<ButtonPress-1>", on_press)
+    canvas.bind("<B1-Motion>", on_drag)
+    canvas.bind("<ButtonRelease-1>", on_release)
+    root.bind("<Return>", on_confirm)
+    root.bind("<Escape>", on_cancel)
+    root.after(100, root.focus_force)
+    root.mainloop()
+    if not selection:
+        raise ValueError("已取消答题弹窗标定")
+    config = QuizCalibration(video_config.window_class, video_config.window_rect, (width, height), selection[0])
+    config.validate()
     return config
 
 

@@ -2,4 +2,8 @@
 __pycache__/
 .pytest_cache/
 config.json
+# 【新增】答题弹窗坐标含本机窗口布局，和视频标定一样只留在本机。
+quiz_config.json
+# 【新增】本机 MiMo 接口地址与 API Key，只保留在工作目录，避免提交密钥。
+mimo_config.json
 *.pyc

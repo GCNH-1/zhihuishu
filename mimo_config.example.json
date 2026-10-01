@@ -1,0 +1,4 @@
+{
+  "api_url": "https://api.xiaomimimo.com/v1/chat/completions",
+  "api_key": "<填入你的 MiMo API Key>"
+}

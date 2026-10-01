@@ -140,3 +140,18 @@ class SwitchController:
 
         self.state = "stopped"
         return Decision("stop", reason)
+
+    # 【新增】答题期间视频计时不推进；关闭弹窗后重新起算播放确认超时。
+    # 参数: reading (TimerReading) 关闭弹窗后的计时；now (float) 当前单调时钟。
+    # 返回: 无；下一轮 update 只验证视频是否重新推进。
+    def after_quiz_play(self, reading: TimerReading, now: float) -> None:
+        """将答题后的播放点击纳入原有单次确认状态。"""
+
+        self.state = "waiting_progress"
+        self.state_at = now
+        self.last_valid_at = now
+        self.last_progress_at = now
+        self.reset_current = reading.current
+        self.last_current = reading.current
+        self.last_total = reading.total
+        self.end_hits = 0
